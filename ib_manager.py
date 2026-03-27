@@ -7,7 +7,7 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
 from urllib.request import urlopen
 
@@ -157,6 +157,61 @@ class IBOrderManager:
     # -----------------------------
     def _build_contract(self):
         return Stock(self.symbol, self.exchange, self.currency)
+
+    @staticmethod
+    def _normalizar_fecha_barra(raw_date: Any) -> datetime:
+        if isinstance(raw_date, datetime):
+            dt = raw_date
+        elif hasattr(raw_date, "year") and hasattr(raw_date, "month") and hasattr(raw_date, "day"):
+            dt = datetime(int(raw_date.year), int(raw_date.month), int(raw_date.day))
+        else:
+            text = str(raw_date).strip()
+            dt = datetime.strptime(text[:8], "%Y%m%d")
+
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    def obtener_barras_historicas(
+        self,
+        symbol: str,
+        duration_str: str = "420 D",
+        bar_size_setting: str = "1 day",
+        what_to_show: str = "TRADES",
+        use_rth: bool = True,
+        exchange: Optional[str] = None,
+        currency: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        if IB is None or Stock is None:
+            raise RuntimeError("Falta instalar ib_insync para descargar datos desde IB Gateway")
+
+        if not self.ensure_connection() or self._ib is None:
+            raise RuntimeError("No hay conexión con IB Gateway para descargar datos")
+
+        contrato = Stock(symbol, exchange or self.exchange, currency or self.currency)
+        self._ib.qualifyContracts(contrato)
+        barras = self._ib.reqHistoricalData(
+            contrato,
+            endDateTime="",
+            durationStr=duration_str,
+            barSizeSetting=bar_size_setting,
+            whatToShow=what_to_show,
+            useRTH=use_rth,
+            formatDate=1,
+        )
+
+        resultado: List[Dict[str, Any]] = []
+        for barra in barras:
+            resultado.append(
+                {
+                    "date": self._normalizar_fecha_barra(getattr(barra, "date", None)),
+                    "open": float(getattr(barra, "open", 0.0) or 0.0),
+                    "high": float(getattr(barra, "high", 0.0) or 0.0),
+                    "low": float(getattr(barra, "low", 0.0) or 0.0),
+                    "close": float(getattr(barra, "close", 0.0) or 0.0),
+                }
+            )
+        return resultado
 
     def _position_for_symbol(self, ib: IB) -> Tuple[int, Optional[float]]:
         pos = 0
