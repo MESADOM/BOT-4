@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import math
+import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -15,7 +16,7 @@ import SORT as modulo_short_trend
 # CONFIG
 # ============================================================
 
-VERSION_SISTEMA = "2.2.6"
+VERSION_SISTEMA = "3.3.1"
 
 BASE_DIR = Path(__file__).resolve().parent
 DIR_DATOS = BASE_DIR / "datos"
@@ -57,6 +58,18 @@ REGIMEN_MEAN_REVERSION = "MEAN_REVERSION"
 REGIMEN_NO_TRADE = "NO_TRADE"
 
 MODO_META = "LONG_SHORT"
+
+MODO_EJECUCION_BACKTEST = "backtest"
+MODO_EJECUCION_PAPER = "paper"
+MODO_EJECUCION_REAL = "live"
+
+IB_HOST_POR_DEFECTO = "127.0.0.1"
+IB_PORT_PAPER = 4002
+IB_PORT_REAL = 4001
+IB_SYMBOL = "TQQQ"
+IB_EXCHANGE = "SMART"
+IB_CURRENCY = "USD"
+RUTA_ESTADO_SENALES_IB = DIR_DATOS / "ib_signal_state.json"
 
 
 # ============================================================
@@ -113,6 +126,17 @@ class EstadoDiagnostico:
     senales_no_ejecutadas_sin_capital: int = 0
 
 
+@dataclass
+class SenalOperativa:
+    signal_id: str
+    fecha: datetime
+    tipo: str
+    accion: str
+    modulo: str
+    unidades: int
+    motivo: str
+
+
 # ============================================================
 # UTILIDADES
 # ============================================================
@@ -159,6 +183,20 @@ def guardar_csv(ruta: Path, filas: List[Dict[str, Any]]) -> None:
                 else:
                     serializada[k] = v
             writer.writerow(serializada)
+
+
+def _cargar_env_local(path_env: Path) -> None:
+    if not path_env.exists():
+        return
+    for linea in path_env.read_text(encoding="utf-8").splitlines():
+        texto = linea.strip()
+        if not texto or texto.startswith("#") or "=" not in texto:
+            continue
+        clave, valor = texto.split("=", 1)
+        clave = clave.strip()
+        valor = valor.strip().strip('"').strip("'")
+        if clave and clave not in os.environ:
+            os.environ[clave] = valor
 
 
 def _serializar_tsv(value: Any) -> str:
@@ -876,7 +914,8 @@ def preparar_datos(
 
 def ejecutar_meta_bot(
     df: List[Dict[str, Any]],
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any], List[Dict[str, Any]], Dict[str, Any]]:
+    devolver_estado_final: bool = False,
+) -> Any:
     capital_actual = float(CAPITAL_INICIAL_EUR)
     operacion_abierta: Optional[OperacionAbierta] = None
     operaciones: List[Dict[str, Any]] = []
@@ -1261,6 +1300,15 @@ def ejecutar_meta_bot(
     metricas["activaciones_logica_a"] = activaciones_logica_a
     resumen_regimen = crear_resumen_regimen(operaciones_ordenadas)
 
+    if devolver_estado_final:
+        estado_final = {
+            "capital_actual": capital_actual,
+            "operacion_abierta": operacion_abierta,
+            "ultima_fecha_salida_ejecutada": ultima_fecha_salida_ejecutada,
+            "activaciones_logica_a": activaciones_logica_a,
+        }
+        return operaciones_ordenadas, metricas, diagnostico_regimen_tsv, resumen_regimen, estado_final
+
     return operaciones_ordenadas, metricas, diagnostico_regimen_tsv, resumen_regimen
 
 
@@ -1357,18 +1405,188 @@ def crear_metricas_diagnosticas(df_operaciones: List[Dict[str, Any]], estado: Es
     }
 
 
+def _calcular_unidades_entrada_para_hoy(
+    hoy: Dict[str, Any],
+    estado_final: Dict[str, Any],
+    operaciones: List[Dict[str, Any]],
+) -> int:
+    capital_actual = float(estado_final.get("capital_actual", CAPITAL_INICIAL_EUR))
+    regimen_entrada = str(hoy.get("regimen_sizing", REGIMEN_DEFENSIVO))
+    porcentaje_objetivo, max_unidades = obtener_parametros_sizing(regimen_entrada)
+
+    score_funcionamiento = calcular_score_funcionamiento_sistema_2(operaciones)
+    funcionamiento = clasificar_funcionamiento_sistema_2(score_funcionamiento)
+    ajuste_funcionamiento = calcular_ajuste_funcionamiento(funcionamiento)
+    sizing_2 = float(hoy.get("sizing_2", 0.90) or 0.90)
+    sizing_final = calcular_sizing_final(sizing_2, ajuste_funcionamiento)
+
+    qqq3_close_hoy = float(hoy.get("qqq3_close", 0.0) or 0.0)
+    if qqq3_close_hoy <= 0:
+        return 0
+
+    capital_objetivo = capital_actual * porcentaje_objetivo * sizing_final
+    unidades_teoricas = int(math.floor(capital_objetivo / qqq3_close_hoy))
+    return max(0, min(unidades_teoricas, max_unidades))
+
+
+def generar_senal_operativa(
+    datos_base: List[Dict[str, Any]],
+    operaciones: List[Dict[str, Any]],
+    estado_final: Dict[str, Any],
+) -> Optional[SenalOperativa]:
+    if not datos_base:
+        return None
+
+    hoy = datos_base[-1]
+    fecha_hoy = hoy.get("fecha")
+    if not isinstance(fecha_hoy, datetime):
+        return None
+
+    operacion_abierta = estado_final.get("operacion_abierta")
+    ultima_fecha_salida = estado_final.get("ultima_fecha_salida_ejecutada")
+
+    if operacion_abierta is not None:
+        ret20_hoy = hoy.get("ret20")
+        qqq3_close_hoy = hoy.get("qqq3_close")
+        if qqq3_close_hoy is None:
+            return None
+
+        beneficio_flotante_eur = 0.0
+        if operacion_abierta.modulo_activo == REGIMEN_LONG_TREND:
+            beneficio_flotante_eur = (
+                (float(qqq3_close_hoy) - operacion_abierta.precio_entrada) * operacion_abierta.unidades
+            ) - COMISION_POR_OPERACION_EUR
+        elif operacion_abierta.modulo_activo == REGIMEN_SHORT_TREND:
+            beneficio_flotante_eur = (
+                (operacion_abierta.precio_entrada - float(qqq3_close_hoy)) * operacion_abierta.unidades
+            ) - COMISION_POR_OPERACION_EUR
+
+        condicion_logica_a = (
+            ret20_hoy is not None and float(ret20_hoy) < 0 and beneficio_flotante_eur <= UMBRAL_SALIDA_LOGICA_A_EUR
+        )
+        motivo = ""
+        if condicion_logica_a:
+            motivo = MOTIVO_SALIDA_LOGICA_A
+        elif operacion_abierta.modulo_activo == REGIMEN_LONG_TREND:
+            motivo = modulo_long_trend.senal_salida(hoy, operacion_abierta) or ""
+        elif operacion_abierta.modulo_activo == REGIMEN_SHORT_TREND:
+            motivo = modulo_short_trend.senal_salida(hoy, operacion_abierta) or ""
+
+        if motivo:
+            accion = "SELL" if operacion_abierta.modulo_activo == REGIMEN_LONG_TREND else "BUY"
+            tipo = "EXIT_LONG" if operacion_abierta.modulo_activo == REGIMEN_LONG_TREND else "EXIT_SHORT"
+            signal_id = f"{fecha_hoy.strftime('%Y%m%d')}-{tipo}-{motivo}"
+            return SenalOperativa(
+                signal_id=signal_id,
+                fecha=fecha_hoy,
+                tipo=tipo,
+                accion=accion,
+                modulo=operacion_abierta.modulo_activo,
+                unidades=int(operacion_abierta.unidades),
+                motivo=motivo,
+            )
+        return None
+
+    meta_regimen_hoy = hoy.get("meta_regimen", REGIMEN_NO_TRADE)
+    permitir_entrada = False
+    modulo = ""
+    if meta_regimen_hoy == REGIMEN_LONG_TREND:
+        permitir_entrada = modulo_long_trend.permite_entrada(
+            hoy=hoy,
+            ultima_fecha_salida_ejecutada=ultima_fecha_salida,
+            operaciones=operaciones,
+        )
+        modulo = REGIMEN_LONG_TREND
+    elif meta_regimen_hoy == REGIMEN_SHORT_TREND:
+        permitir_entrada = modulo_short_trend.permite_entrada(
+            hoy=hoy,
+            ultima_fecha_salida_ejecutada=ultima_fecha_salida,
+            operaciones=operaciones,
+        )
+        modulo = REGIMEN_SHORT_TREND
+
+    if not permitir_entrada:
+        return None
+
+    unidades = _calcular_unidades_entrada_para_hoy(hoy=hoy, estado_final=estado_final, operaciones=operaciones)
+    if unidades <= 0:
+        return None
+
+    if modulo == REGIMEN_LONG_TREND:
+        return SenalOperativa(
+            signal_id=f"{fecha_hoy.strftime('%Y%m%d')}-ENTRY_LONG",
+            fecha=fecha_hoy,
+            tipo="ENTRY_LONG",
+            accion="BUY",
+            modulo=modulo,
+            unidades=unidades,
+            motivo=f"QQQ>SMA{PERIODO_MEDIA_LARGA}",
+        )
+
+    return SenalOperativa(
+        signal_id=f"{fecha_hoy.strftime('%Y%m%d')}-ENTRY_SHORT",
+        fecha=fecha_hoy,
+        tipo="ENTRY_SHORT",
+        accion="SELL",
+        modulo=modulo,
+        unidades=unidades,
+        motivo=f"QQQ<SMA{PERIODO_MEDIA_LARGA}",
+    )
+
+
 # ============================================================
 # MAIN
 # ============================================================
 
-def ejecutar_bot() -> Dict[str, Any]:
+def ejecutar_bot(
+    modo: str = MODO_EJECUCION_BACKTEST,
+    ib_manager: Optional[Any] = None,
+) -> Dict[str, Any]:
     df_qqq = cargar_csv(RUTA_QQQ)
     df_qqq3 = cargar_csv(RUTA_QQQ3)
     df_vix = cargar_csv(RUTA_VIX)
 
     df_base = preparar_datos(df_qqq=df_qqq, df_qqq3=df_qqq3, df_vix=df_vix)
-    df_operaciones, metricas, diagnostico_regimen_tsv, resumen_regimen = ejecutar_meta_bot(df_base)
+    (
+        df_operaciones,
+        metricas,
+        diagnostico_regimen_tsv,
+        resumen_regimen,
+        estado_final,
+    ) = ejecutar_meta_bot(df_base, devolver_estado_final=True)
     df_resumen_anual = crear_resumen_anual(df_operaciones)
+    senal_operativa = generar_senal_operativa(
+        datos_base=df_base,
+        operaciones=df_operaciones,
+        estado_final=estado_final,
+    )
+
+    ib_resultado: Optional[Dict[str, Any]] = None
+    modo_normalizado = str(modo).strip().lower()
+    if modo_normalizado in {MODO_EJECUCION_PAPER, MODO_EJECUCION_REAL}:
+        _cargar_env_local(BASE_DIR / ".env")
+        if ib_manager is None:
+            from ib_manager import IBOrderManager
+
+            client_id = int(os.getenv("IB_CLIENT_ID", "1"))
+            host = os.getenv("IB_HOST", IB_HOST_POR_DEFECTO)
+            port = int(
+                os.getenv(
+                    "IB_PORT",
+                    str(IB_PORT_PAPER if modo_normalizado == MODO_EJECUCION_PAPER else IB_PORT_REAL),
+                )
+            )
+            ib_manager = IBOrderManager(
+                host=host,
+                port=port,
+                client_id=client_id,
+                symbol=IB_SYMBOL,
+                exchange=IB_EXCHANGE,
+                currency=IB_CURRENCY,
+                state_path=RUTA_ESTADO_SENALES_IB,
+            )
+
+        ib_resultado = ib_manager.procesar_senal(senal_operativa)
 
     if GUARDAR_RESULTADOS:
         guardar_csv(RUTA_SALIDA_OPERACIONES, df_operaciones)
@@ -1382,6 +1600,9 @@ def ejecutar_bot() -> Dict[str, Any]:
         "metricas": metricas,
         "diagnostico_regimen": diagnostico_regimen_tsv,
         "resumen_regimen": resumen_regimen,
+        "senal_operativa": None if senal_operativa is None else senal_operativa.__dict__,
+        "modo_ejecucion": modo_normalizado,
+        "ib_resultado": ib_resultado,
     }
 
 
