@@ -67,9 +67,11 @@ IB_HOST_POR_DEFECTO = "127.0.0.1"
 IB_PORT_PAPER = 4002
 IB_PORT_REAL = 4001
 IB_SYMBOL = "TQQQ"
+IB_SYMBOL_QQQ = "QQQ"
 IB_EXCHANGE = "SMART"
 IB_CURRENCY = "USD"
 RUTA_ESTADO_SENALES_IB = DIR_DATOS / "ib_signal_state.json"
+IB_DATA_DURATION_STR = "420 D"
 
 
 # ============================================================
@@ -163,6 +165,60 @@ def cargar_csv(ruta: Path) -> List[Dict[str, Any]]:
     with open(ruta, "r", encoding="utf-8-sig", newline="") as fh:
         reader = csv.DictReader(fh)
         return [dict(r) for r in reader]
+
+
+def cargar_datos_para_modo(
+    modo: str,
+    ib_manager: Optional[Any] = None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], Optional[Any]]:
+    modo_normalizado = str(modo).strip().lower()
+    if modo_normalizado == MODO_EJECUCION_BACKTEST:
+        return (
+            cargar_csv(RUTA_QQQ),
+            cargar_csv(RUTA_QQQ3),
+            cargar_csv(RUTA_VIX),
+            ib_manager,
+        )
+
+    _cargar_env_local(BASE_DIR / ".env")
+    if ib_manager is None:
+        from ib_manager import IBOrderManager
+
+        client_id = int(os.getenv("IB_CLIENT_ID", "1"))
+        host = os.getenv("IB_HOST", IB_HOST_POR_DEFECTO)
+        port = int(
+            os.getenv(
+                "IB_PORT",
+                str(IB_PORT_PAPER if modo_normalizado == MODO_EJECUCION_PAPER else IB_PORT_REAL),
+            )
+        )
+        ib_manager = IBOrderManager(
+            host=host,
+            port=port,
+            client_id=client_id,
+            symbol=IB_SYMBOL,
+            exchange=IB_EXCHANGE,
+            currency=IB_CURRENCY,
+            state_path=RUTA_ESTADO_SENALES_IB,
+        )
+
+    duration_str = os.getenv("IB_DATA_DURATION", IB_DATA_DURATION_STR).strip() or IB_DATA_DURATION_STR
+    df_qqq = ib_manager.obtener_barras_historicas(
+        symbol=IB_SYMBOL_QQQ,
+        duration_str=duration_str,
+        bar_size_setting="1 day",
+        what_to_show="TRADES",
+    )
+    df_qqq3 = ib_manager.obtener_barras_historicas(
+        symbol=IB_SYMBOL,
+        duration_str=duration_str,
+        bar_size_setting="1 day",
+        what_to_show="TRADES",
+    )
+    # VIX no participa en los cálculos de estrategia actuales.
+    df_vix: List[Dict[str, Any]] = []
+
+    return df_qqq, df_qqq3, df_vix, ib_manager
 
 
 def guardar_csv(ruta: Path, filas: List[Dict[str, Any]]) -> None:
@@ -1542,9 +1598,11 @@ def ejecutar_bot(
     modo: str = MODO_EJECUCION_BACKTEST,
     ib_manager: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    df_qqq = cargar_csv(RUTA_QQQ)
-    df_qqq3 = cargar_csv(RUTA_QQQ3)
-    df_vix = cargar_csv(RUTA_VIX)
+    modo_normalizado = str(modo).strip().lower()
+    df_qqq, df_qqq3, df_vix, ib_manager = cargar_datos_para_modo(
+        modo=modo_normalizado,
+        ib_manager=ib_manager,
+    )
 
     df_base = preparar_datos(df_qqq=df_qqq, df_qqq3=df_qqq3, df_vix=df_vix)
     (
@@ -1562,9 +1620,7 @@ def ejecutar_bot(
     )
 
     ib_resultado: Optional[Dict[str, Any]] = None
-    modo_normalizado = str(modo).strip().lower()
     if modo_normalizado in {MODO_EJECUCION_PAPER, MODO_EJECUCION_REAL}:
-        _cargar_env_local(BASE_DIR / ".env")
         if ib_manager is None:
             from ib_manager import IBOrderManager
 
